@@ -6,3 +6,4 @@ __pycache__/
 /runs/p1-data-*/
 runs/
 MUJOCO_LOG.TXT
+/patches/
