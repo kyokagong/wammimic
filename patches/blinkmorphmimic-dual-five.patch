@@ -1,0 +1,238 @@
+--- a/preview/server.py
++++ b/preview/server.py
+@@ -62,13 +62,16 @@
+ 
+ 
+ class Catalog:
+-    def __init__(self, root, checkpoints, *, interface='motion', reference_manifest=None):
++    def __init__(self, root, checkpoints, *, interface='motion', reference_manifest=None, five_point_source='original_human'):
+         if interface not in ('motion','human'):
+             raise ValueError('Unknown release interface')
+         self.interface = interface
+         self.recovery_windows = None
+         self.flip_sources = None
+         self.flip_motions = {}
++        if five_point_source not in ('original_human', 'robot_reference', 'mixed'):
++            raise ValueError('Unknown five-point source')
++        self.five_point_source = five_point_source
+         self.training_manifest = None
+         self.training_manifest_sha256 = None
+         self.reference_manifest = None
+@@ -118,7 +121,7 @@
+             for robot in ROBOTS:
+                 self.motions[robot] = {name: path for name, path in self.motions[robot].items()
+                     if (robot, name) in self.records
+-                    and (interface != 'human' or self.records[robot, name].get('human_available'))}
++                    and (interface != 'human' or self.point_available(self.records[robot, name]))}
+         self.motion_hashes={(row.get('robot'),row.get('name')):row.get('output_sha256') for row in records}
+         sources = {(row.get("robot"), row.get("name")): row.get("source_id") for row in records}
+         common = set.intersection(*(set(self.motions[r]) for r in ROBOTS))
+@@ -129,6 +132,12 @@
+             and len({sources.get((r, name)) for r in ROBOTS}) == 1
+         }
+ 
++    def point_available(self, row):
++        if self.five_point_source == 'original_human':
++            return row.get('human_available', False)
++        return row.get('five_point_available', False) and (
++            self.five_point_source == 'mixed' or row.get('five_point_source') == self.five_point_source)
++
+     @property
+     def reference_path(self):
+         return self.reference_manifest or self.training_manifest
+@@ -136,7 +145,10 @@
+     @property
+     def human_root(self):
+         manifest = self.reference_path
+-        value = json.loads(manifest.read_text()).get('human_root', str(self.root / 'human50')) if manifest else str(self.root / 'human50')
++        document = json.loads(manifest.read_text()) if manifest else {}
++        field = {'original_human': 'human_root', 'robot_reference': 'robot_reference_root',
++                 'mixed': 'five_point_root'}[self.five_point_source]
++        value = document.get(field, str(self.root / 'human50'))
+         return str(self.root / value) if self.reference_manifest is not None else value
+ 
+     def verify_reference_manifest(self):
+@@ -169,7 +181,7 @@
+             raise ValueError('Motion reference SHA differs from its pinned data manifest')
+         if self.reference_manifest is not None:
+             from preview.reference import verify_neutral_reference
+-            verify_neutral_reference(self.records[robot, motion], path, self.root, review=self.neutral_review, human=self.interface == 'human')
++            verify_neutral_reference(self.records[robot, motion], path, self.root, review=self.neutral_review, human=self.interface == 'human', keypoint_source=self.five_point_source)
+         if motion in self.flip_motions:
+             entry = self.flip_sources
+             if entry['path'].is_symlink() or sha256(entry['path']) != entry['sha256']:
+@@ -275,7 +287,7 @@
+                 if not (contract['source_start_frame'] <= start < contract['source_stop_frame']
+                         and start < hold < row['frames'] - 2):
+                     raise ValueError('Recovery start must remain inside its source action window')
+-                verify_neutral_reference(row, path, self.root, review=self.neutral_review, human=self.interface == 'human')
++                verify_neutral_reference(row, path, self.root, review=self.neutral_review, human=self.interface == 'human', keypoint_source=self.five_point_source)
+             if self.interface == 'human':
+                 human = (self.root / row.get('human_sidecar','')) if self.reference_manifest is not None else Path(row.get('human_sidecar',''))
+                 if not row.get('human_available') or human.is_symlink() or not human.is_file() or sha256(human) != row.get('human_sha256'):
+@@ -298,7 +310,7 @@
+     releases = {}
+     for row in rows:
+         fields = {'id','label','data_root','checkpoints','interface','parent_iteration','human_updates'}
+-        if not fields <= set(row) <= fields | {'training_manifest','reference_manifest','recovery_windows','flip_sources'}:
++        if not fields <= set(row) <= fields | {'training_manifest','reference_manifest','recovery_windows','flip_sources','five_point_source'}:
+             raise ValueError('Invalid fixed release fields')
+         training = row.get('training_manifest')
+         if row.get('reference_manifest') is not None and training is None:
+@@ -341,7 +353,7 @@
+                 ckpt=torch.load(check.path,map_location='cpu',weights_only=False)
+                 verify_human_identity(ckpt,robot=robot,update=check.iteration,data_sha256=data_hash,training_sha256=training_hash)
+                 check.verify()
+-        catalog = Catalog(row['data_root'],checks,interface=row['interface'],reference_manifest=row.get('reference_manifest'))
++        catalog = Catalog(row['data_root'],checks,interface=row['interface'],reference_manifest=row.get('reference_manifest'), five_point_source=row.get('five_point_source', 'original_human'))
+         catalog.training_manifest, catalog.training_manifest_sha256 = training_path, training_hash
+         if row.get("recovery_windows") is not None: catalog.set_recovery_windows(row["recovery_windows"])
+         if row.get("flip_sources") is not None: catalog.set_flip_sources(row["flip_sources"])
+@@ -390,7 +402,7 @@
+                 saved_cfg = saved["cfg"]
+                 goal_anchor = saved_cfg.get("goal_anchor", "reference")
+                 self.policy, self.meta = load_policy(checkpoint.path, device, interface=interface,
+-                    human_points=human_points,kp_horizon=1,goal_anchor=goal_anchor)
++                    human_points=human_points,kp_horizon=saved_cfg.get('kp_fixed_horizon') or 10,goal_anchor=goal_anchor)
+             else:
+                 entry = shared_policy.entries[robot]
+                 saved_cfg = entry['cfg']
+@@ -665,6 +677,7 @@
+                     'release_id':self.release_id,
+                     'releases':[dict(id=name,**{k:v for k,v in entry.items() if k!='catalog'},
+                         interface=entry['catalog'].interface,
++                        five_point_source=entry['catalog'].five_point_source,
+                         joint_training=entry['catalog'].training_manifest is not None,
+                         neutral_standing=entry['catalog'].recovery_windows is not None,
+                         flips=entry['catalog'].flip_sources is not None) for name,entry in self.releases.items()],
+@@ -742,6 +755,8 @@
+                 data = dict(data, human_points='five')
+             if 'human_points' in data and (catalog.interface!='human' or data['human_points'] not in ('five','full')):
+                 raise ValueError('Human points must be five or full on a human release')
++            if catalog.five_point_source == 'robot_reference' and data.get('human_points', 'five') != 'five':
++                raise ValueError('Robot reference commands provide exactly five points')
+             catalog.select(data["robot"], data["motion"])
+         elif action in ("start", "pause", "reset"):
+             if set(data) != {"action"}:
+@@ -797,6 +812,11 @@
+                                        if 'recording' in request else self.catalog_for(release_id))
+                             with self.lock:
+                                 self.release_id,self.catalog = release_id,catalog
++                            source_kind = catalog.five_point_source
++                            if source_kind == 'mixed':
++                                source_robot = ROBOTS[0] if request['robot'] == 'all' else request['robot']
++                                source_kind = catalog.records[source_robot, request['motion']]['five_point_source']
++                            self.update(five_point_source=source_kind)
+                             session_factory = self.factory
+                             if self.backend=='cpu':
+                                 from functools import partial
+--- a/preview/reference.py
++++ b/preview/reference.py
+@@ -53,7 +53,7 @@
+     return contract
+ 
+ 
+-def verify_neutral_reference(row, path, root, *, review, human=False):
++def verify_neutral_reference(row, path, root, *, review, human=False, keypoint_source='original_human'):
+     import numpy as np
+     from morphmimic.data.neutral_bookends import validate_boundary
+     from preview.server import sha256
+@@ -73,6 +73,12 @@
+         raise ValueError('Approved neutral target SHA differs')
+     with np.load(target, allow_pickle=False) as source:
+         validate_boundary(data, {key: source[key] for key in source.files}, row['robot'], contract, target_frame=11446)
++    if human and keypoint_source in ('mixed', 'robot_reference') and row.get('five_point_source') == 'robot_reference':
++        side = reference_path(root, row['five_point_sidecar'])
++        if (not row.get('five_point_available') or sha256(side) != row['five_point_sha256']
++                or row['five_point_provenance']['reference_sha256'] != row['output_sha256']):
++            raise ValueError('Robot reference keypoint provenance differs')
++        return
+     if human:
+         if not row.get('human_available'):
+             raise ValueError('Neutral reference has no authentic human sidecar')
+--- a/preview/shared_policy.py
++++ b/preview/shared_policy.py
+@@ -24,12 +24,13 @@
+             checkpoints[robot].verify()
+         saved = _load([checkpoints[r].path for r in ROBOTS])
+         first = saved['q1']
++        self.kp_horizon = first['cfg'].get('kp_fixed_horizon') or 10
+         state = first.get('ema_policy', first['policy'])
+         self.entries = {}
+         for robot in ROBOTS:
+             ck = saved[robot]
+             if any(ck['cfg'].get(k) != first['cfg'].get(k) for k in
+-                   ('policy_hidden', 'act', 'hist_len', 'latent')) or ck['morph']['film'] != first['morph']['film']:
++                   ('policy_hidden', 'act', 'hist_len', 'latent', 'kp_fixed_horizon')) or ck['morph']['film'] != first['morph']['film']:
+                 raise ValueError(f'{robot}: shared policy configuration differs')
+             if (ck['_path'] != str(checkpoints[robot].path) or ck['cfg']['robot'] != robot
+                     or ck['iteration'] != checkpoints[robot].iteration):
+@@ -86,9 +87,9 @@
+             feedback = (torch.cat([sessions[r].goals['ref_feedback'].to(self.device) for r in ROBOTS]),)
+         if self.interface=='human':
+             goal = torch.cat([sessions[r].goals['goal_kp'].to(self.device) for r in ROBOTS])
+-            points,frames,heading = fixed_human_masks(3,self.human_points,1,history.device)
++            points,frames,heading = fixed_human_masks(3,self.human_points,self.kp_horizon,history.device)
+             valid = torch.cat([sessions[r].goals['human_joint_valid'].to(self.device) for r in ROBOTS])
+-            five,_,_ = fixed_human_masks(3,'five',1,history.device)
++            five,_,_ = fixed_human_masks(3,'five',self.kp_horizon,history.device)
+             if not bool((five & valid).eq(five).all()):
+                 raise ValueError('Human preview requires all five tracked joints')
+             points &= valid
+--- a/preview/release.py
++++ b/preview/release.py
+@@ -11,12 +11,12 @@
+     if (not isinstance(training_sha256, str) or not re.fullmatch('[0-9a-f]{64}', training_sha256)
+         or cfg.get('robot') != robot or ckpt.get('iteration') != update
+         or cfg.get('optimization_schema') != 1 or cfg.get('kp_interface') is not True
+-        or cfg.get('kp_fixed_horizon') != 1 or cfg.get('policy_goal') != 'motion'
++        or type(cfg.get('kp_fixed_horizon')) is not int or not 1 <= cfg['kp_fixed_horizon'] <= 10 or cfg.get('policy_goal') != 'motion'
+         or cfg.get('optimizer') != 'muon' or identity.get('schema_version') != 1
+         or identity.get('iteration') != update or identity.get('optimizer') != 'muon'
+         or type(cfg.get('num_envs')) is not int or cfg['num_envs'] not in (2048, 4096)
+         or type(identity.get('num_envs')) is not int or identity['num_envs'] != cfg['num_envs']
+         or identity.get('joint_motion_human') is not True
+-        or identity.get('human_horizon') != 1 or identity.get('human_points') != 'five'
++        or identity.get('human_horizon') != cfg['kp_fixed_horizon'] or identity.get('human_points') != 'five'
+         or identity.get('prepared_manifest_sha256') != training_sha256):
+         raise ValueError('Joint checkpoint identity differs from its fixed robot, iteration, training mode or manifest')
+--- a/preview/static/app.js
++++ b/preview/static/app.js
+@@ -173,7 +173,12 @@
+   }
+   const release = (next.releases || []).find(r => r.id===$('release').value);
+   $('human-points').disabled = release?.interface!=='human';
+-  $('release-note').textContent = release?.interface==='human' ? (release.joint_training ? '动作与人体联合训练；人体当前帧输入。MotionDecode 暂缺人体原始数据。' : '原 motion 30000 教师 + 独立人体更新；人体当前帧输入。MotionDecode 暂缺人体原始数据。') : release?.id==='motiondecode-30000' ? 'MotionDecode 使用原 Motion 30000 权重；暂无人体配对数据。点击下方八极拳或舞蹈，再载入动作。' : release?.joint_training ? '动作与人体联合训练；Motion 输入包含已准备的机器人参考动作，MotionDecode 暂缺人体配对数据。' : 'Motion 输入：包含已准备的机器人参考动作。';
++  if (release?.five_point_source === 'robot_reference') { $('human-points').value = 'five'; $('human-points').disabled = true; }
++  $('release-note').textContent = release?.five_point_source === 'robot_reference'
++    ? '机器人参考五点来自所选机型的 FK 轨迹，保持该机型尺度。预览长度与诊断状态见所选模型标签。'
++    : release?.five_point_source === 'mixed' ? '按动作来源使用原始人体五点或机器人参考五点。'
++    : release?.interface === 'human' ? '原始人体五点输入，可载入配对人体动作或上传 PICO 录制。'
++    : 'Motion 输入包含已准备的全身机器人参考动作。';
+   const generation = next.session_generation ?? 0;
+   if (generation !== (state.session_generation ?? 0)) {
+     closePeer(); retryCount = 0; connectWhenReady = true;
+@@ -190,7 +195,8 @@
+   $('active').textContent = state.robot ? `当前运行：${compare ? '三本体同屏' : '单本体'} · ${names[state.robot] || state.robot} · ${picoRecords.find(r => r.id===state.recording_id)?.filename || state.motion || '—'}${activeRelease ? ' · '+activeRelease.label : ''}${inputMode ? ' · '+inputMode : ''}` : '当前运行：尚未载入';
+   $('runtime').textContent = loading() ? '正在载入固定策略与物理环境…' : state.error ? '仿真错误，请重新载入动作' : state.failed ? '物理失败，整个会话已暂停；点击「重置」后才能继续' : state.completed ? '动作完成；点击「重置」可重新播放' : state.playing ? '策略驱动物理仿真 · 播放中' : state.robot ? '仿真已暂停' : '尚未载入仿真';
+   $('legend').textContent = standingHold ? '实色：实际策略与物理。半透明：已审核的自然垂手站立目标；目标保持时物理继续运行。' : compare ? 'Q1 / Bumi / G1 均为实际策略驱动的物理本体，保留真实尺寸；同源舞蹈主体同步。' : '实色：实际策略与物理。半透明：参考目标。';
+-  if (state.human_five_overlay) $('legend').textContent += ' 橙色：人体输入五点（骨盆、双腕、双踝），按原始人体尺度显示。';
++  if (state.human_five_overlay && state.five_point_source === 'robot_reference') $('legend').textContent += ' 橙色：机器人参考五点，保留当前机型的米制尺度。';
++  else if (state.human_five_overlay) $('legend').textContent += ' 橙色：人体输入五点（骨盆、双腕、双踝），按原始人体尺度显示。';
+   $('progress').textContent = `${state.steps || 0} 控制步 / ${standingHold ? '持续站立目标' : (state.clip_frames || '—')+' 帧'} · ${number(state.simulated_seconds || 0, 2)} 仿真秒`;
+   $('physics-stats').textContent = `实测物理 ${number(state.simulation_hz)} Hz · 渲染 ${number(state.render_fps)} fps · 仿真速度 ${number(state.sim_speed, 2)}×`;
+   const failures = participants.filter(participant => participant.failed).map(participant => `${names[participant.robot] || participant.robot} ${terminal(participant)}`);
+--- a/scripts/run_mimic.py
++++ b/scripts/run_mimic.py
+@@ -91,7 +91,10 @@
+         if manifest.get("complete") is not True:
+             raise ValueError("Prepared training manifest is incomplete")
+         windows = data / "windows.json"
+-        values = train_optimized.config_values(data, manifest["human_root"], run.parent, run.name, args.gpu_ids)
++        point_root = manifest.get("five_point_root", manifest["human_root"])
++        values = train_optimized.config_values(data, point_root, run.parent, run.name, args.gpu_ids)
++        if "five_point_root" in manifest:
++            values.update(kp_fixed_horizon=10, kp_preview_mix=False)
+         values.update(
+             iterations=ITERATIONS, lr_decay_iters=ITERATIONS,
+             ckpt_every=CHECKPOINT_EVERY, keep_checkpoints=KEEP_CHECKPOINTS,

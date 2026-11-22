@@ -1,0 +1,28 @@
+{
+  "sources": {
+    "robomocap": {
+      "raw": "robomocap",
+      "output": "human-new",
+      "download_manifest": "robomocap-p1.json",
+      "processing_manifest": "robomocap-p1-processing.json",
+      "label_provenance": "optical_mocap_solved_skeleton"
+    },
+    "openhlm": {
+      "raw": "openhlm",
+      "output": "gripper",
+      "download_manifest": "openhlm-p1-expanded.json",
+      "label_provenance": "robot_fk_with_stance_odometry"
+    },
+    "nymeria": {
+      "raw": "nymeria",
+      "output": "nymeria",
+      "download_manifest": "nymeria-p1-private.json",
+      "label_provenance": "xsens_inertial_mocap_reference"
+    },
+    "sim": {
+      "raw": "sim_loco_tabletop",
+      "output": "sim",
+      "label_provenance": "mujoco_simulated_robot_state"
+    }
+  }
+}

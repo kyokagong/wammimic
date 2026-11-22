@@ -1,0 +1,183 @@
+--- a/preview/server.py
++++ b/preview/server.py
+@@ -358,10 +358,11 @@
+         if backend=='cpu' and control_graph:raise ValueError('CPU preview does not support control graph')
+         if backend=='cpu' and str(device)!='cpu':raise ValueError('CPU preview currently requires a CPU actor')
+         self.backend=backend
++        self._human_five_positions = None
+         import torch
+         import yaml
+         from mjlab.utils.torch import configure_torch_backends
+-        from morphmimic.constants import PROPRIO_DIM
++        from morphmimic.constants import HUMAN_FIVE_IDX, PROPRIO_DIM
+         from morphmimic.env.env_cfg import COMMAND_NAME, morphmimic_env_cfg
+         from morphmimic.env.morphmimic_env import MorphMimicEnv
+         from morphmimic.eval.policy_loader import load_policy
+@@ -424,6 +425,12 @@
+                 raise ValueError('Standing hold frame must be inside the selected recovery clip')
+             if self.meta.interface=='human' and not self.command.library.has_human:
+                 raise ValueError('This motion has no original human sidecar')
++            if backend == 'warp' and interface == 'human' and human_points == 'five':
++                library = self.command.library
++                valid = library.human_valid_at(library.clip_start)[0, list(HUMAN_FIVE_IDX)]
++                poses = library.human_pos_w[:, list(HUMAN_FIVE_IDX)].float()
++                self._human_five_positions = poses.masked_fill(~valid[None, :, None], float('nan')).cpu().numpy()
++                self._human_five_origin = self.env.scene.env_origins[0].cpu().numpy().copy()
+             self.history = ObsHistory(1, self.meta.hist_len, PROPRIO_DIM, self.env.device)
+             if render:
+                 if backend=='cpu':
+@@ -580,6 +587,7 @@
+                     clip_frames=int(self.command.library.clip_len[0]), reward=self.total_reward,
+                     failed=self.failed, completed=self.completed, termination_terms=terms,
+                     interface=self.meta.interface, input_mode=self.meta.mode, checkpoint_iteration=self.meta.iteration,
++                    human_five_overlay=self._human_five_positions is not None,
+                     training_data=self.meta.train_cfg.get("subset_yaml"),
+                     training_share=self.meta.train_cfg.get("share"),
+                     training_physics=self.training_physics,
+@@ -591,10 +599,23 @@
+                     source_frames=self.source_window["source_frames"] if self.source_window else int(self.command.library.clip_len[0]),
+                     physics=self.env.physics_diagnostics.report())
+ 
++    def human_five_points(self):
++        if self._human_five_positions is None:
++            return None
++        from preview.human_five import frame_points
++        return frame_points(self._human_five_positions, self.start_frame, self.steps,
++                            self.hold_frame, self._human_five_origin)
++
+     def frame_rgb(self):
+         if self.renderer is None:
+             raise ValueError("This policy session has no individual renderer")
+-        self.renderer.update(self.env.sim.data, debug_vis_callback=self.command._debug_vis_impl)
++        def overlays(visualizer):
++            self.command._debug_vis_impl(visualizer)
++            points = self.human_five_points()
++            if points is not None:
++                from preview.human_five import draw_five
++                draw_five(visualizer, points)
++        self.renderer.update(self.env.sim.data, debug_vis_callback=overlays)
+         return self.renderer.render().copy()
+ 
+     def frame(self):
+--- a/preview/comparison.py
++++ b/preview/comparison.py
+@@ -157,6 +157,7 @@
+                     interface=next(iter(participants.values())).get('interface'),
+                     clip_frames=self.clip_frames, failed=self.failed, completed=self.completed,
+                     participants=list(participants.values()),
++                    human_five_overlay=any(p.get('human_five_overlay', False) for p in participants.values()),
+                     failed_robots=[r for r, s in participants.items() if s['failed']],
+                     parallel_physics=self.executor is not None,
+                     shared_policy=True, inference_batch_size=3, actor_forward_calls=self.policy.calls,
+@@ -172,12 +173,18 @@
+         if self.renderer is None:
+             self.renderer = AsyncComparisonRenderer(lambda: ComparisonRenderer(self.sessions))
+             reset = True
+-        poses = {}
++        poses, targets = {}, {}
+         for robot, child in self.sessions.items():
+             value = child.env.sim.data.qpos[0]
+             if hasattr(value, 'detach'):
+                 value = value.detach().cpu().numpy()
+             poses[robot] = value.copy()
++            if hasattr(child, 'human_five_points'):
++                points = child.human_five_points()
++                if points is not None:
++                    targets[robot] = points
++        if targets:
++            poses['human_five'] = targets
+         self.renderer.submit(poses, reset=reset)
+ 
+     def latest_render(self):
+@@ -322,6 +329,13 @@
+                                     self.np.array([1., 1., 1., 1.], dtype=self.np.float32))
+             label.label = robot.upper() + ' policy'
+             scene.ngeom += 1
++        if poses.get('human_five'):
++            from mjlab.viewer.native.visualizer import MujocoNativeDebugVisualizer
++            from preview.human_five import draw_five, in_comparison_lane
++            visualizer = MujocoNativeDebugVisualizer(self.renderer.scene, self.model, env_idx=0)
++            for robot, points in poses['human_five'].items():
++                origin, rotation, _, lane = self.origins[robot]
++                draw_five(visualizer, in_comparison_lane(points, origin, rotation, lane))
+         return self.renderer.render().copy()
+ 
+     def close(self):
+--- /dev/null
++++ b/preview/human_five.py
+@@ -0,0 +1,28 @@
++"""Human input landmarks as world-space debug geoms."""
++
++import numpy as np
++
++FIVE_COLOR = (1.0, 0.58, 0.10, 1.0)
++LINK_COLOR = (1.0, 0.58, 0.10, 0.48)
++
++
++def frame_points(positions, start, steps, hold, origin):
++    """The rendered physics tick, including the final frame and standing hold."""
++    last = len(positions) - 1 if hold is None else hold
++    return positions[min(start + steps, last)] + origin
++
++
++def in_comparison_lane(points, origin, rotation, lane):
++    visible = points.copy()
++    visible[:, :2] = (points[:, :2] - origin) @ rotation.T + lane
++    return visible
++
++
++def draw_five(visualizer, points):
++    valid = np.isfinite(points).all(axis=-1)
++    for index, point in enumerate(points):
++        if not valid[index]:
++            continue
++        if index and valid[0] and np.linalg.norm(point - points[0]) > 1e-6:
++            visualizer.add_cylinder(points[0], point, 0.009, LINK_COLOR)
++        visualizer.add_sphere(point, 0.039 if index == 0 else 0.031, FIVE_COLOR)
+--- a/preview/static/app.js
++++ b/preview/static/app.js
+@@ -154,6 +154,7 @@
+   $('active').textContent = state.robot ? `当前运行：${compare ? '三本体同屏' : '单本体'} · ${names[state.robot] || state.robot} · ${state.motion || '—'}${activeRelease ? ' · '+activeRelease.label : ''}${inputMode ? ' · '+inputMode : ''}` : '当前运行：尚未载入';
+   $('runtime').textContent = loading() ? '正在载入固定策略与物理环境…' : state.error ? '仿真错误，请重新载入动作' : state.failed ? '物理失败，整个会话已暂停；点击「重置」后才能继续' : state.completed ? '动作完成；点击「重置」可重新播放' : state.playing ? '策略驱动物理仿真 · 播放中' : state.robot ? '仿真已暂停' : '尚未载入仿真';
+   $('legend').textContent = standingHold ? '实色：实际策略与物理。半透明：已审核的自然垂手站立目标；目标保持时物理继续运行。' : compare ? 'Q1 / Bumi / G1 均为实际策略驱动的物理本体，保留真实尺寸；同源舞蹈主体同步。' : '实色：实际策略与物理。半透明：参考目标。';
++  if (state.human_five_overlay) $('legend').textContent += ' 橙色：人体输入五点（骨盆、双腕、双踝），按原始人体尺度显示。';
+   $('progress').textContent = `${state.steps || 0} 控制步 / ${standingHold ? '持续站立目标' : (state.clip_frames || '—')+' 帧'} · ${number(state.simulated_seconds || 0, 2)} 仿真秒`;
+   $('physics-stats').textContent = `实测物理 ${number(state.simulation_hz)} Hz · 渲染 ${number(state.render_fps)} fps · 仿真速度 ${number(state.sim_speed, 2)}×`;
+   const failures = participants.filter(participant => participant.failed).map(participant => `${names[participant.robot] || participant.robot} ${terminal(participant)}`);
+--- /dev/null
++++ b/tests/test_human_five_overlay.py
+@@ -0,0 +1,34 @@
++from types import SimpleNamespace
++
++import numpy as np
++
++from preview.human_five import draw_five, frame_points, in_comparison_lane
++
++
++def test_frame_clock_and_lane_use_fixed_reference_transforms():
++    positions = np.arange(90, dtype=float).reshape((6, 5, 3))
++    origin = np.array([1., -2., 0.])
++    np.testing.assert_array_equal(frame_points(positions, 1, 0, None, origin), positions[1] + origin)
++    points = frame_points(positions, 1, 10, 4, origin)
++    np.testing.assert_array_equal(points, positions[4] + origin)
++    rotation = np.array([[0., -1.], [1., 0.]])
++    lane = in_comparison_lane(points, points[0, :2], rotation, np.array([0., 2.]))
++    np.testing.assert_array_equal(lane[0, :2], [0., 2.])
++    np.testing.assert_array_equal(lane[:, 2], points[:, 2])
++    np.testing.assert_array_equal(np.linalg.norm(lane[1:] - lane[0], axis=-1),
++                                  np.linalg.norm(points[1:] - points[0], axis=-1))
++
++
++def test_draw_five_and_skip_unavailable_points():
++    drawn = []
++    lines = []
++    viz = SimpleNamespace(add_sphere=lambda point, *args: drawn.append(point),
++                          add_cylinder=lambda a, b, *args: lines.append((a, b)))
++    points = np.arange(15, dtype=float).reshape((5, 3))
++    draw_five(viz, points)
++    assert len(drawn) == 5 and len(lines) == 4
++    drawn.clear()
++    lines.clear()
++    points[2] = np.nan
++    draw_five(viz, points)
++    assert len(drawn) == 4 and len(lines) == 3

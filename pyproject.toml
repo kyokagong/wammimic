@@ -1,0 +1,23 @@
+[project]
+name = "wammimic"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = ["numpy", "scipy", "pyarrow", "pillow", "mujoco", "torch", "safetensors", "transformers", "accelerate", "einops", "requests", "huggingface-hub"]
+
+[project.optional-dependencies]
+nymeria = ["projectaria-tools==2.4.0"]
+train = ["diffusers==0.37.1", "tensorboard", "matplotlib", "rerun-sdk==0.31.4"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["wammimic*"]
+
+[tool.setuptools.package-data]
+"wammimic._vendor" = ["NOTICE.md", "provenance.json"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

@@ -1,0 +1,114 @@
+--- a/preview/server.py
++++ b/preview/server.py
+@@ -104,7 +104,12 @@
+         if self.reference_manifest is not None:
+             from preview.reference import neutral_contract, reference_path, review_document
+             self.neutral_review = document.get("neutral_review")
+-            review_document(self.root, self.neutral_review)
++            self.official_q1_recovery = document.get('official_q1_recovery') is True
++            if self.official_q1_recovery:
++                if not records or any(row.get('robot') != 'q1' or not row.get('official_motion') for row in records):
++                    raise ValueError('Invalid official Q1 recovery inventory')
++            else:
++                review_document(self.root, self.neutral_review)
+             human_root = self.root / document.get('human_root', 'human50')
+             if (not human_root.is_dir() or human_root != human_root.resolve(strict=True)
+                     or not human_root.is_relative_to(self.root)):
+@@ -114,7 +119,8 @@
+             for (robot, name), record in self.records.items():
+                 if robot not in ROBOTS or self.motions[robot].get(name) != reference_path(self.root, record['output']):
+                     raise ValueError('Motion outside its fixed reference root or inventory')
+-                neutral_contract(record)
++                if not record.get('official_motion'):
++                    neutral_contract(record)
+                 if record.get('human_available'):
+                     if reference_path(self.root, record['human_sidecar']) != human_root / robot / (name + '.npz'):
+                         raise ValueError('Migrated human sidecar differs from the loader human root')
+@@ -678,6 +684,7 @@
+                     'releases':[dict(id=name,**{k:v for k,v in entry.items() if k!='catalog'},
+                         interface=entry['catalog'].interface,
+                         five_point_source=entry['catalog'].five_point_source,
++                        official_q1_recovery=getattr(entry['catalog'], 'official_q1_recovery', False),
+                         joint_training=entry['catalog'].training_manifest is not None,
+                         neutral_standing=entry['catalog'].recovery_windows is not None,
+                         flips=entry['catalog'].flip_sources is not None) for name,entry in self.releases.items()],
+--- a/preview/reference.py
++++ b/preview/reference.py
+@@ -57,6 +57,26 @@
+     import numpy as np
+     from morphmimic.data.neutral_bookends import validate_boundary
+     from preview.server import sha256
++    official = row.get('official_motion')
++    if official:
++        raw = reference_path(root, official['path'])
++        report = reference_path(root, official['validation'])
++        qa = json.loads(report.read_text())
++        if (row['robot'] != 'q1' or official['repository'] != 'PrimebotTech/primebot_rl_mjlab'
++                or official['revision'] != '2153a6c561b3b755ae5bcca89683cb66d5ad5852'
++                or sha256(raw) != official['sha256']
++                or official['sha256'] != '133e79d897eef3d7a2988019245f75b460e5cfac2d7571b4447345aa71db4344'
++                or sha256(report) != official['validation_sha256']
++                or not qa['complete'] or not qa['original_joint_positions_preserved']
++                or qa['native_fk_position_error_m'] > 1e-5
++                or path != reference_path(root, row['output']) or sha256(path) != row['output_sha256']
++                or qa['output_sha256'] != row['output_sha256']):
++            raise ValueError('Official Q1 recovery provenance differs')
++        if human:
++            side = reference_path(root, row['five_point_sidecar'])
++            if keypoint_source != 'robot_reference' or sha256(side) != row['five_point_sha256'] or qa['five_point_sha256'] != row['five_point_sha256']:
++                raise ValueError('Official recovery requires robot reference five points')
++        return
+     contract = neutral_contract(row)
+     if path != reference_path(root, row['output']) or sha256(path) != row['output_sha256']:
+         raise ValueError('Neutral reference SHA differs')
+--- a/preview/static/app.js
++++ b/preview/static/app.js
+@@ -23,6 +23,10 @@
+ function standupRelease() {
+   const releases = state.releases || [];
+   const selected = selectedRelease();
++  if (selectedRobot()==='q1' && $('standup-pose').value==='lying') {
++    const official = releases.find(r => r.official_q1_recovery && r.interface===(selected?.interface || 'motion'));
++    if (official) return official;
++  }
+   if (selected?.interface==='human' && selected.neutral_standing) return selected;
+   return releases.find(r => r.interface==='motion' && r.neutral_standing) || releases.find(r => r.id==='joint-motion-6000') || releases.find(r => r.id==='joint-motion-5000');
+ }
+@@ -53,7 +57,10 @@
+   const recovery = standupRelease();
+   $('standup').disabled=loading() || !recovery;
+   $('standup-pose').disabled=loading();
+-  $('standup').textContent='站起来：载入姿态'+(recovery ? ' · '+recovery.id.replace(/^joint-(motion|human)-/, '')+(recovery.interface==='human' ? ' · 人体五点' : '') : '');
++  $('standup-note').textContent = recovery?.official_q1_recovery
++    ? 'Q1 躺卧使用 Primebot 官方 q1_getUp 参考。载入后先看初始姿态，再点击播放。橙色为机型参考五点，当前策略的起身能力以实际物理结果为准。'
++    : '载入选定初始姿态后，点击播放查看策略起身；重置返回初始姿态。';
++  $('standup').textContent='站起来：载入姿态'+(recovery ? ' · '+recovery.id.replace(/^joint-(motion|human)-/, '')+(recovery.interface==='human' ? (recovery.five_point_source==='robot_reference' ? ' · 机器人参考五点' : ' · 人体五点') : '') : '');
+   const hasMotionDecode=!!motionDecodeRelease();
+   $('motiondecode-actions').hidden=!hasMotionDecode;
+   for (const id of ['motiondecode-baji','motiondecode-dance']) $(id).disabled=loading() || !hasMotionDecode;
+@@ -107,8 +114,13 @@
+   if (loading() || !release) return;
+   const pose=$('standup-pose').value || 'lying';
+   $('release').value=release.id;
+-  $('search').value=pose==='half_squat' ? 'fallAndGetUp1_subject5' : 'fallAndGetUp2_subject2';
++  $('search').value=release.official_q1_recovery ? 'official_q1_getup' : pose==='half_squat' ? 'fallAndGetUp1_subject5' : 'fallAndGetUp2_subject2';
+   motions();
++  if (release.official_q1_recovery) {
++    $('human-points').value='five';
++    return control('select', {robot:'q1', motion:'official_q1_getup', release:release.id,
++      ...(release.interface==='human' ? {human_points:'five'} : {})});
++  }
+   return control('standup', {robot:selectedRobot(), release:release.id, pose});
+ });
+ $('flips').addEventListener('click',()=>{
+--- a/preview/static/index.html
++++ b/preview/static/index.html
+@@ -26,7 +26,7 @@
+   </section>
+   <label for="standup-pose">起身初始姿态</label><select id="standup-pose"><option value="lying">躺卧</option><option value="seated">坐姿</option><option value="half_squat">半蹲</option></select>
+   <button id="standup" type="button" disabled>站起来：载入姿态</button>
+-  <p class="note">载入后先查看初始姿态，再点击「播放」。从选定的 LAFAN1 姿态开始，策略尝试起身并继续跟踪；「重置」返回同一初始姿态。优先使用当前已发布模型。支持单本体与三本体同屏；失败会停止并显示原因。</p>
++  <p id="standup-note" class="note">载入初始姿态后，点击播放查看策略起身。</p>
+   <div id="motiondecode-actions" hidden>
+     <p class="note">MotionDecode 动作</p>
+     <div class="buttons"><button id="motiondecode-baji" type="button">八极拳（baji）</button><button id="motiondecode-dance" type="button">舞蹈（dance）</button></div>

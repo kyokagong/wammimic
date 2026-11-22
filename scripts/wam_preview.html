@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>WAM Action Expert · 评估回放</title>
+  <style>
+    :root { color-scheme: dark; font: 16px system-ui, sans-serif; background: #101621; color: #edf2fa; }
+    body { max-width: 1080px; margin: 36px auto; padding: 0 18px 32px; }
+    h1 { font-size: clamp(1.55rem, 4vw, 2.5rem); margin-bottom: .45rem; }
+    p { color: #b4c4d7; line-height: 1.5; }
+    .controls { display: flex; align-items: baseline; flex-wrap: wrap; gap: 12px; margin: 24px 0 12px; }
+    select, button { font: inherit; color: inherit; background: #202d41; border: 1px solid #526883; border-radius: 6px; padding: 8px 10px; min-width: 0; }
+    button { cursor: pointer; } button:disabled { opacity: .55; }
+    video { display: block; width: 100%; aspect-ratio: 3/2; background: #080b12; border-radius: 8px; }
+    .table { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; white-space: nowrap; }
+    th, td { border-bottom: 1px solid #384a60; text-align: left; padding: 12px 10px; }
+    #status { margin-left: auto; color: #a7dbf2; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1 id="title">WAM Action Expert</h1>
+    <p id="run">正在读取评估结果…</p>
+    <div class="controls">
+      <label for="case">回放片段</label>
+      <select id="case" disabled></select>
+      <button id="connect" disabled>播放</button>
+      <span id="status" role="status">等待连接</span>
+    </div>
+    <video id="video" autoplay muted playsinline controls aria-label="五点预测与动捕参考 WebRTC 回放"></video>
+    <p id="detail"></p>
+    <h2 id="results-title">留出集指标 <small>· Seed 0</small></h2>
+    <div class="table"><table>
+      <thead><tr id="headings"><th>划分</th><th>窗口</th><th>ADE (mm)</th><th>FDE (mm)</th><th>平均旋转误差 (°)</th></tr></thead>
+      <tbody id="metrics"></tbody>
+    </table></div>
+  </main>
+  <script type="module">
+    const byId = id => document.getElementById(id);
+    const picker = byId("case"), button = byId("connect"), status = byId("status"), video = byId("video");
+    const splits = {val: "验证集", test: "测试集"};
+    const scopes = {operation_session_holdout: "操作 · 留出会话", walking_subject_holdout: "行走 · 留出参与者"};
+    let connection, peer;
+    const post = async (endpoint, body, keepalive = false) => {
+      const response = await fetch("api/" + endpoint, {
+        method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body), keepalive
+      });
+      if (!response.ok) throw new Error("HTTP " + response.status);
+      if (response.status !== 204) return response.json();
+    };
+    async function close() {
+      connection?.close();
+      connection = undefined;
+      video.srcObject = null;
+      const old = peer;
+      peer = undefined;
+      if (old) await post("close", {peer: old}, true).catch(() => {});
+    }
+    async function connect() {
+      button.disabled = picker.disabled = true;
+      status.textContent = "建立 WebRTC 连接…";
+      try {
+        await close();
+        const pc = connection = new RTCPeerConnection({iceServers: []});
+        pc.addTransceiver("video", {direction: "recvonly"});
+        pc.ontrack = ({track}) => { video.srcObject = new MediaStream([track]); };
+        pc.onconnectionstatechange = () => {
+          if (connection !== pc) return;
+          if (pc.connectionState === "connected") status.textContent = "WebRTC 已连接";
+          if (["failed", "disconnected"].includes(pc.connectionState)) status.textContent = "连接中断，请重连";
+        };
+        await pc.setLocalDescription(await pc.createOffer());
+        const answer = await post("offer", {case: Number(picker.value), sdp: pc.localDescription.sdp});
+        peer = answer.peer;
+        await pc.setRemoteDescription({type: answer.type, sdp: answer.sdp});
+        button.textContent = "重连";
+      } catch (error) {
+        await close();
+        status.textContent = "连接失败 · " + error.message;
+      } finally {
+        button.disabled = picker.disabled = false;
+      }
+    }
+    window.addEventListener("pagehide", close);
+    button.onclick = connect;
+    function resultsRow(values) {
+      const row = byId("metrics").insertRow();
+      for (const value of values) row.insertCell().textContent = value;
+    }
+    function setGenie({step, mimic_step, robot, backend, cases}) {
+      const names = {"press-button": "按蓝色按钮", "matching-block-contact": "接触同色方块"};
+      const modes = {
+        reference: "参考五点 + Mimic",
+        reference_sampled: "参考五点 · 同频采样 + Mimic",
+        reference_retargeted: "参考五点 · WAM 重定向 + Mimic",
+        wam_mimic: "WAM + Mimic",
+        hold: "中立站姿基线",
+      };
+      const failures = {timeout: "超时", anchor_pos: "骨盆高度偏差", anchor_ori: "姿态倾斜",
+        "anchor_pos+anchor_ori": "骨盆高度与姿态偏差", physics_overflow: "物理容量异常"};
+      document.title = "Genie Sim 场景 · " + robot + " 闭环评估";
+      byId("title").textContent = document.title;
+      byId("run").textContent = "WAM " + step + " 步 · Mimic " + mimic_step + " 步 · " + backend +
+        " · Genie Sim 场景按 Q1 尺度适配。按键要求手接触且行程 ≥3 mm，同色方块只计物理接触。";
+      const credit = document.createElement("p");
+      credit.innerHTML = '场景与道具来自 <a href="https://huggingface.co/datasets/agibot-world/GenieSimAssets">AgiBot Genie Sim</a>。场景改编与回放采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a>。';
+      document.querySelector("main").append(credit);
+      video.style.aspectRatio = "16 / 9";
+      video.setAttribute("aria-label", "Q1 闭环评估 WebRTC 回放");
+      byId("results-title").textContent = "任务结果";
+      const header = byId("headings");
+      header.replaceChildren();
+      for (const name of ["任务", "控制方式", "成功 / 回合", "最近腕距（cm）", "最大按钮行程（mm）", "终止原因"]) {
+        const cell = document.createElement("th");
+        cell.textContent = name;
+        header.append(cell);
+      }
+      cases.forEach((item, i) => {
+        picker.add(new Option([names[item.scenario], modes[item.mode], "Seed " + item.seed].join(" / "), i));
+      });
+      const reference = cases.findIndex(item => item.mode === "reference");
+      picker.selectedIndex = reference >= 0 ? reference : Math.max(0, cases.findIndex(item => item.mode === "wam_mimic"));
+      for (const [scenario, label] of Object.entries(names)) {
+        for (const [mode, controller] of Object.entries(modes)) {
+          const group = cases.filter(item => item.scenario === scenario && item.mode === mode);
+          if (!group.length) continue;
+          const travel = group.filter(item => item.button_max_travel_m !== null).map(item => item.button_max_travel_m);
+          resultsRow([label, controller, group.filter(item => item.success).length + " / " + group.length,
+            Math.min(...group.map(item => item.min_wrist_distance_m * 100)).toFixed(1),
+            travel.length ? (1000 * Math.max(...travel)).toFixed(1) : "—",
+            [...new Set(group.map(item => item.success ? "成功" : failures[item.termination] || item.termination))].join("、")]);
+        }
+      }
+      return item => (item.scenario === "press-button" && item.success
+        ? "触发于 " + ((item.steps - 1) * .02).toFixed(2) + " 秒"
+        : (item.steps * .02).toFixed(2) + " 秒") + " · " + modes[item.mode] +
+        (item.planning_calls ? " · 轨迹更新 " + item.planning_calls + " 次" : "") + " · 最近腕距 " +
+        (item.min_wrist_distance_m * 100).toFixed(1) + " cm · 接触帧数 " + item.hand_contact_steps +
+        (item.button_max_travel_m === null ? "" : " · 按键行程 " + (item.button_max_travel_m * 1000).toFixed(1) + " mm");
+    }
+    try {
+      const response = await fetch("api/cases");
+      if (!response.ok) throw new Error("HTTP " + response.status);
+      const catalog = await response.json();
+      const {step, cases, metrics} = catalog;
+      let describe;
+      if (catalog.kind === "geniesim_q1") {
+        describe = setGenie(catalog);
+      } else {
+        byId("run").textContent = "第 " + step + " 个优化器步 · 预测未来 1 秒的人体五点位姿";
+        cases.forEach((item, i) => {
+          picker.add(new Option([splits[item.split], scopes[item.scope],
+            item.selection === "fixed" ? "固定片段" : "最高 ADE 片段"].join(" / "), i));
+        });
+        picker.selectedIndex = Math.max(0, cases.findIndex(item => item.split === "test" && item.selection === "fixed"));
+        describe = item => "会话 " + item.episode + " · 起始帧 " + item.frame +
+          " · ADE " + item.ade_mm.toFixed(1) + " mm · 平均旋转误差 " + item.rotation_deg.toFixed(1) +
+          "°。画面同步显示参考 RGB、动捕参考与预测轨迹。";
+        for (const {split, metrics: values} of metrics) {
+          resultsRow([splits[split], values.samples, values.ade_mm.toFixed(1),
+            values.fde_mm.toFixed(1), values.rotation_mean_deg.toFixed(1)]);
+        }
+      }
+      const detail = () => { byId("detail").textContent = describe(cases[Number(picker.value)]); };
+      picker.onchange = () => { detail(); connect(); };
+      detail();
+      button.disabled = picker.disabled = false;
+    } catch (error) {
+      status.textContent = "评估结果读取失败 · " + error.message;
+    }
+  </script>
+</body>
+</html>

@@ -1,0 +1,255 @@
+--- a/src/morphmimic/train/importance_sampling.py
++++ b/src/morphmimic/train/importance_sampling.py
+@@ -11,7 +11,7 @@
+ import torch
+ 
+ 
+-def source_balanced_clip_weights(clip_names, manifest_rows, robot):
++def source_balanced_clip_weights(clip_names, manifest_rows, robot, *, balance_sources=True):
+   """CPU metadata only: equal dataset mass, then equal clips within each dataset."""
+   selected = [row for row in manifest_rows if row.get('robot') == robot and row.get('split') == 'train']
+   rows = {row['name']: row for row in selected}
+@@ -22,6 +22,8 @@
+   datasets = [rows[name].get('dataset') for name in clip_names]
+   if any(not isinstance(group, str) or not group.strip() or group != group.strip() for group in datasets):
+     raise ValueError('Every training clip requires its manifest dataset')
++  if not balance_sources:
++    datasets = ['all_motions'] * len(datasets)
+   group_names = tuple(sorted(set(datasets)))
+   counts = Counter(datasets)
+   weights = torch.tensor([1.0 / (len(group_names) * counts[group]) for group in datasets], dtype=torch.float32)
+@@ -184,7 +186,9 @@
+                        clips=int((s['clip_group'] == index).sum()), visits=int(s['visits'][mask].sum()),
+                        unseen_bins=int((s['visits'][mask] == 0).sum())))
+   return dict(semantics_version=2, groups=groups,
+-              source_balance='Equal dataset base mass, then equal clip and bin mass; actual probabilities remain adaptive, not fixed dataset quotas.',
++              source_balance=('Equal clip base mass, then equal bins within each clip; no source or category quotas.'
++                              if library.importance_group_names == ('all_motions',) else
++                              'Equal dataset base mass, then equal clip and bin mass; actual probabilities remain adaptive, not fixed dataset quotas.'),
+               failure_definition='terminated / finished rollouts of the actual collector policy by sampled start bin; timeout is a clean short rollout, not full-clip success', ema_alpha=.02,
+               base_mix=.3, difficulty_mix=.7, priority_cap=8., unseen_prior=dict(failure=.5, error=.5),
+               policy='Actual collector policy selected by trainer masks/configuration; statistics are pooled across environments and not separated by interface.',
+--- a/src/morphmimic/train/trainer.py
++++ b/src/morphmimic/train/trainer.py
+@@ -368,6 +368,7 @@
+   recovery_windows: str | None = None
+   recovery_windows_sha256: str | None = None
+   importance_sampling: bool = False
++  importance_source_balance: bool = True
+   flip_windows: str | None = None
+   flip_windows_sha256: str | None = None
+   flip_reset_share: float = 0.0
+@@ -1457,7 +1458,8 @@
+     if cfg.importance_sampling:
+       from morphmimic.train.importance_sampling import source_balanced_clip_weights
+       weights, groups, clip_groups = source_balanced_clip_weights(self.library.clip_names,
+-        json.loads(Path(cfg.prepared_manifest).read_text())['clips'], cfg.robot)
++        json.loads(Path(cfg.prepared_manifest).read_text())['clips'], cfg.robot,
++        balance_sources=cfg.importance_source_balance)
+       self.library.importance_clip_weights = weights.to(self.library.bin_clip.device)
+       self.library.importance_group_names = groups
+       self.library.importance_clip_groups = clip_groups.to(self.library.bin_clip.device)
+--- a/src/morphmimic/train/recovery.py
++++ b/src/morphmimic/train/recovery.py
+@@ -119,7 +119,7 @@
+ 
+ 
+ def sample_window_frames(frames, windows, share):
+-    if windows is None:
++    if windows is None or share == 0:
+         return frames
+     starts, stops, weights = windows
+     choices = torch.multinomial(weights, frames.numel(), replacement=True)
+--- a/scripts/audit_importance.py
++++ b/scripts/audit_importance.py
+@@ -184,7 +184,8 @@
+         full, tail = divmod(row['frames'], 50)
+         count = full + int(tail >= 25 or (tail > 0 and full == 0))
+         bins.extend([index] * count); starts.extend(offset + 50*j for j in range(count)); offset += row['frames']
+-    weights, group_names, clip_groups = source_balanced_clip_weights(names, manifest['clips'], robot)
++    weights, group_names, clip_groups = source_balanced_clip_weights(names, manifest['clips'], robot,
++        balance_sources=checkpoint['cfg'].get('importance_source_balance', True))
+     initial = create_state(SimpleNamespace(num_clips=len(names), bin_clip=torch.tensor(bins), bin_start=torch.tensor(starts),
+         importance_clip_weights=weights, importance_group_names=group_names, importance_clip_groups=clip_groups))
+     importance = checkpoint['importance_sampling']
+--- a/scripts/evaluate_recovery.py
++++ b/scripts/evaluate_recovery.py
+@@ -170,14 +170,14 @@
+         case['reference_standing_height_m'] = float(standing_target['body_pos'][0,2]) if standing_target else height
+         case['path'] = str(path)
+         if interface == 'human':
+-            if not row.get('human_available'): continue
+-            proof[row['human_sidecar']] = row['human_sha256']
++            if not row.get('five_point_available', row.get('human_available')): continue
++            proof[row.get('five_point_sidecar', row.get('human_sidecar'))] = row.get('five_point_sha256', row.get('human_sha256'))
+         selected.append(case)
+     if not selected: raise ValueError(f'No {interface} recovery cases for {robot}')
+     if set(case['category'] for case in selected) != set(CATEGORIES):
+         raise ValueError(f'{interface} recovery cases must cover every category for {robot}')
+     verify_hashes(proof)
+-    return selected, proof, manifest.get('human_root')
++    return selected, proof, manifest.get('five_point_root', manifest.get('human_root'))
+ 
+ 
+ def checkpoint_identity(path, robot, training_sha):
+@@ -367,7 +367,8 @@
+     from morphmimic.eval.policy_loader import load_policy
+     configure_torch_backends(allow_tf32=False)
+     goal_anchor = saved['cfg'].get('goal_anchor','reference')
+-    policy,meta = load_policy(args.ckpt,'cuda:0',interface=args.interface,human_points='five',kp_horizon=1,goal_anchor=goal_anchor)
++    kp_horizon = saved['cfg'].get('kp_fixed_horizon') or 10
++    policy,meta = load_policy(args.ckpt,'cuda:0',interface=args.interface,human_points='five',kp_horizon=kp_horizon,goal_anchor=goal_anchor)
+     if meta.robot != args.robot or meta.iteration != identity['iteration']: raise ValueError('Loaded policy identity differs')
+     with tempfile.TemporaryDirectory(prefix='recovery-eval-') as temporary:
+         subset = Path(temporary)/'subset.yaml'
+@@ -386,7 +387,7 @@
+         scope='Bounded prepared reference poses, deterministic nominal physics; not arbitrary autonomous get-up.',
+         window_definition='start_frame:stop_frame is the reset interval; evaluation starts at start_frame and runs to the configured timeout or clip exhaustion',
+         created_utc=datetime.now(timezone.utc).isoformat(),robot=args.robot,interface=args.interface,
+-        human_points='five' if args.interface=='human' else None,kp_horizon=1,seed=args.seed,
++        human_points='five' if args.interface=='human' else None,kp_horizon=kp_horizon,seed=args.seed,
+         checkpoint=identity,parent_checkpoint=parent,criteria=criteria,floor_height_m=0.,height_definition='actual tracked pelvis z minus environment origin z, flat floor at zero',training_manifest_sha256=training_sha,
+         input_sha256=proof,physics=physics,training_physics=saved.get('physics'),
+         actual_num_envs=min(args.num_envs,len(cases)),elapsed_seconds=time.monotonic()-started,
+--- a/preview/server.py
++++ b/preview/server.py
+@@ -104,7 +104,12 @@
+         if self.reference_manifest is not None:
+             from preview.reference import neutral_contract, reference_path, review_document
+             self.neutral_review = document.get("neutral_review")
+-            review_document(self.root, self.neutral_review)
++            self.official_q1_recovery = document.get('official_q1_recovery') is True
++            if self.official_q1_recovery:
++                if not records or any(row.get('robot') != 'q1' or not row.get('official_motion') for row in records):
++                    raise ValueError('Invalid official Q1 recovery inventory')
++            else:
++                review_document(self.root, self.neutral_review)
+             human_root = self.root / document.get('human_root', 'human50')
+             if (not human_root.is_dir() or human_root != human_root.resolve(strict=True)
+                     or not human_root.is_relative_to(self.root)):
+@@ -114,7 +119,8 @@
+             for (robot, name), record in self.records.items():
+                 if robot not in ROBOTS or self.motions[robot].get(name) != reference_path(self.root, record['output']):
+                     raise ValueError('Motion outside its fixed reference root or inventory')
+-                neutral_contract(record)
++                if not record.get('official_motion'):
++                    neutral_contract(record)
+                 if record.get('human_available'):
+                     if reference_path(self.root, record['human_sidecar']) != human_root / robot / (name + '.npz'):
+                         raise ValueError('Migrated human sidecar differs from the loader human root')
+@@ -122,6 +128,7 @@
+                 self.motions[robot] = {name: path for name, path in self.motions[robot].items()
+                     if (robot, name) in self.records
+                     and (interface != 'human' or self.point_available(self.records[robot, name]))}
++            self.official_q1_recovery = 'official_q1_getup' in self.motions['q1']
+         self.motion_hashes={(row.get('robot'),row.get('name')):row.get('output_sha256') for row in records}
+         sources = {(row.get("robot"), row.get("name")): row.get("source_id") for row in records}
+         common = set.intersection(*(set(self.motions[r]) for r in ROBOTS))
+@@ -678,6 +685,7 @@
+                     'releases':[dict(id=name,**{k:v for k,v in entry.items() if k!='catalog'},
+                         interface=entry['catalog'].interface,
+                         five_point_source=entry['catalog'].five_point_source,
++                        official_q1_recovery=getattr(entry['catalog'], 'official_q1_recovery', False),
+                         joint_training=entry['catalog'].training_manifest is not None,
+                         neutral_standing=entry['catalog'].recovery_windows is not None,
+                         flips=entry['catalog'].flip_sources is not None) for name,entry in self.releases.items()],
+--- a/preview/reference.py
++++ b/preview/reference.py
+@@ -57,6 +57,26 @@
+     import numpy as np
+     from morphmimic.data.neutral_bookends import validate_boundary
+     from preview.server import sha256
++    official = row.get('official_motion')
++    if official:
++        raw = reference_path(root, official['path'])
++        report = reference_path(root, official['validation'])
++        qa = json.loads(report.read_text())
++        if (row['robot'] != 'q1' or official['repository'] != 'PrimebotTech/primebot_rl_mjlab'
++                or official['revision'] != '2153a6c561b3b755ae5bcca89683cb66d5ad5852'
++                or sha256(raw) != official['sha256']
++                or official['sha256'] != '133e79d897eef3d7a2988019245f75b460e5cfac2d7571b4447345aa71db4344'
++                or sha256(report) != official['validation_sha256']
++                or not qa['complete'] or not qa['original_joint_positions_preserved']
++                or qa['native_fk_position_error_m'] > 1e-5
++                or path != reference_path(root, row['output']) or sha256(path) != row['output_sha256']
++                or qa['output_sha256'] != row['output_sha256']):
++            raise ValueError('Official Q1 recovery provenance differs')
++        if human:
++            side = reference_path(root, row['five_point_sidecar'])
++            if keypoint_source not in ('mixed', 'robot_reference') or sha256(side) != row['five_point_sha256'] or qa['five_point_sha256'] != row['five_point_sha256']:
++                raise ValueError('Official recovery requires robot reference five points')
++        return
+     contract = neutral_contract(row)
+     if path != reference_path(root, row['output']) or sha256(path) != row['output_sha256']:
+         raise ValueError('Neutral reference SHA differs')
+--- a/preview/static/app.js
++++ b/preview/static/app.js
+@@ -23,6 +23,10 @@
+ function standupRelease() {
+   const releases = state.releases || [];
+   const selected = selectedRelease();
++  if (selectedRobot()==='q1' && $('standup-pose').value==='lying') {
++    const official = releases.find(r => r.official_q1_recovery && r.interface===(selected?.interface || 'motion'));
++    if (official) return official;
++  }
+   if (selected?.interface==='human' && selected.neutral_standing) return selected;
+   return releases.find(r => r.interface==='motion' && r.neutral_standing) || releases.find(r => r.id==='joint-motion-6000') || releases.find(r => r.id==='joint-motion-5000');
+ }
+@@ -53,7 +57,10 @@
+   const recovery = standupRelease();
+   $('standup').disabled=loading() || !recovery;
+   $('standup-pose').disabled=loading();
+-  $('standup').textContent='站起来：载入姿态'+(recovery ? ' · '+recovery.id.replace(/^joint-(motion|human)-/, '')+(recovery.interface==='human' ? ' · 人体五点' : '') : '');
++  $('standup-note').textContent = recovery?.official_q1_recovery
++    ? 'Q1 躺卧使用 Primebot 官方 q1_getUp 参考。载入后先看初始姿态，再点击播放。橙色为机型参考五点，当前策略的起身能力以实际物理结果为准。'
++    : '载入选定初始姿态后，点击播放查看策略起身；重置返回初始姿态。';
++  $('standup').textContent='站起来：载入姿态'+(recovery ? ' · '+recovery.id.replace(/^joint-(motion|human)-/, '')+(recovery.interface==='human' ? (recovery.five_point_source==='robot_reference' ? ' · 机器人参考五点' : ' · 人体五点') : '') : '');
+   const hasMotionDecode=!!motionDecodeRelease();
+   $('motiondecode-actions').hidden=!hasMotionDecode;
+   for (const id of ['motiondecode-baji','motiondecode-dance']) $(id).disabled=loading() || !hasMotionDecode;
+@@ -107,8 +114,13 @@
+   if (loading() || !release) return;
+   const pose=$('standup-pose').value || 'lying';
+   $('release').value=release.id;
+-  $('search').value=pose==='half_squat' ? 'fallAndGetUp1_subject5' : 'fallAndGetUp2_subject2';
++  $('search').value=release.official_q1_recovery ? 'official_q1_getup' : pose==='half_squat' ? 'fallAndGetUp1_subject5' : 'fallAndGetUp2_subject2';
+   motions();
++  if (release.official_q1_recovery) {
++    $('human-points').value='five';
++    return control('select', {robot:'q1', motion:'official_q1_getup', release:release.id,
++      ...(release.interface==='human' ? {human_points:'five'} : {})});
++  }
+   return control('standup', {robot:selectedRobot(), release:release.id, pose});
+ });
+ $('flips').addEventListener('click',()=>{
+--- a/preview/static/index.html
++++ b/preview/static/index.html
+@@ -26,7 +26,7 @@
+   </section>
+   <label for="standup-pose">起身初始姿态</label><select id="standup-pose"><option value="lying">躺卧</option><option value="seated">坐姿</option><option value="half_squat">半蹲</option></select>
+   <button id="standup" type="button" disabled>站起来：载入姿态</button>
+-  <p class="note">载入后先查看初始姿态，再点击「播放」。从选定的 LAFAN1 姿态开始，策略尝试起身并继续跟踪；「重置」返回同一初始姿态。优先使用当前已发布模型。支持单本体与三本体同屏；失败会停止并显示原因。</p>
++  <p id="standup-note" class="note">载入初始姿态后，点击播放查看策略起身。</p>
+   <div id="motiondecode-actions" hidden>
+     <p class="note">MotionDecode 动作</p>
+     <div class="buttons"><button id="motiondecode-baji" type="button">八极拳（baji）</button><button id="motiondecode-dance" type="button">舞蹈（dance）</button></div>
+--- a/tests/test_importance_sampling.py
++++ b/tests/test_importance_sampling.py
+@@ -15,6 +15,17 @@
+     module = importlib.util.module_from_spec(spec)
+     spec.loader.exec_module(module)
+     return module
++
++
++def test_uniform_clip_base_has_no_official_or_flip_prior():
++    h = helpers()
++    names = ['walk', 'dance', 'getup', 'flip']
++    rows = [dict(robot='q1', split='train', name=name, dataset=source)
++            for name, source in zip(names, ['lafan1', 'lafan1', 'primebot_official', 'seed_flips'])]
++    weights, groups, ids = h.source_balanced_clip_weights(names, rows, 'q1', balance_sources=False)
++    assert torch.equal(weights, torch.full((4,), .25))
++    assert groups == ('all_motions',)
++    assert torch.equal(ids, torch.zeros(4, dtype=torch.long))
+ 
+ 
+ def library():

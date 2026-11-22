@@ -1,0 +1,8 @@
+__pycache__/
+.pytest_cache/
+/runs/mimic-*/
+/runs/wam-action-*/
+/runs/geniesim-wam-mimic-*/
+/runs/p1-data-*/
+runs/
+MUJOCO_LOG.TXT

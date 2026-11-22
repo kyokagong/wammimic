@@ -1,0 +1,10 @@
+ARG DATA_BASE_IMAGE=wbwam-repro:latest
+FROM ${DATA_BASE_IMAGE}
+WORKDIR /workspace
+COPY wammimic /workspace/wammimic
+COPY tests /workspace/tests
+COPY scripts /workspace/scripts
+COPY conf /workspace/conf
+ENV PYTHONPATH=/workspace PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+ENV OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4
+ENTRYPOINT ["/opt/isaaclab-venv/bin/python", "-m", "wammimic.data_pipeline.prepare"]

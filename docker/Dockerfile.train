@@ -1,0 +1,6 @@
+FROM wammimic:data-phase0
+RUN /opt/isaaclab-venv/bin/python -m pip install --no-cache-dir --no-deps diffusers==0.37.1
+COPY wammimic /workspace/wammimic
+COPY scripts /workspace/scripts
+COPY tests /workspace/tests
+ENTRYPOINT ["/opt/isaaclab-venv/bin/python", "-m", "wammimic.training.run"]
