@@ -90,12 +90,34 @@
       for (const value of values) row.insertCell().textContent = value;
     }
     function setGenie({step, mimic_step, robot, backend, cases}) {
-      const names = {"press-button": "按蓝色按钮", "matching-block-contact": "接触同色方块"};
+      const names = {
+        "home-table-cup-q1": "家庭客厅 · 走到桌前碰水杯 · Q1（2.0m · 15s）",
+        "press-button": "按蓝色按钮（OOD）",
+        "matching-block-contact": "接触同色方块（OOD）",
+        "openhlm-red-can-q1": "OpenHLM 红罐放垫 · Q1（同分布仿真）",
+        "openhlm-red-can-real-sample": "OpenHLM 红罐放垫 · 左原始 5点 vs 右 WAM v2.0 预测",
+        "hiw500-real-sample": "HIW-500 开放世界 · 左原始 5点 vs 右 WAM v2.0 预测",
+        "openhlm-red-can-g1": "OpenHLM 红罐放垫 · G1（同分布）",
+      };
       const modes = {
         reference: "参考五点 + Mimic",
         reference_sampled: "参考五点 · 同频采样 + Mimic",
         reference_retargeted: "参考五点 · WAM 重定向 + Mimic",
-        wam_mimic: "WAM + Mimic",
+        home_cup_emb2_rtc2hz: "WAM 20k + Mimic 40k (RTC 2.5Hz · 0.6s重叠 · emb2)",
+        home_cup_emb1_rtc2hz: "WAM 20k + Mimic 40k (RTC 2.5Hz · 0.6s重叠 · emb1)",
+        home_cup_emb2_rtc5hz: "WAM 20k + Mimic 40k (RTC 5Hz · 0.8s重叠 · emb2)",
+        home_cup_emb1_rtc5hz: "WAM 20k + Mimic 40k (RTC 5Hz · 0.8s重叠 · emb1)",
+        home_cup_emb2_rtc: "WAM 20k + Mimic 40k (RTC 0.4s平滑 · 抬头视角 · emb2)",
+        home_cup_emb1_rtc: "WAM 20k + Mimic 40k (RTC 0.4s平滑 · 抬头视角 · emb1)",
+        home_cup_emb2_08s: "WAM 20k + Mimic 40k (0.8s块 · emb2 真人行走)",
+        home_cup_emb1_08s: "WAM 20k + Mimic 40k (0.8s块 · emb1 机器人操作)",
+        wam_mimic_v2_replan08s: "WAM v2.0 + Mimic 40k (0.8s块执行 · emb2 行走验证)",
+        wam_mimic_v2: "WAM v2.0 + Q1 Mimic 40k (Canonical Bridge)",
+        real_sample: "左：原始 5点 (GT) vs 右：WAM v2.0 预测 5点",
+        wam_mimic: "WAM + Mimic 12k（原桥接）",
+        wam_mimic_yaw_40k: "WAM + Mimic 40k（Yaw+尺度重定向）",
+        wam_mimic_g1_raw_40k: "WAM + Mimic G1 40k（原生 G1）",
+        wam_mimic_g1_yaw_40k: "WAM + Mimic G1 40k（原生 G1+Yaw）",
         hold: "中立站姿基线",
       };
       const failures = {timeout: "超时", anchor_pos: "骨盆高度偏差", anchor_ori: "姿态倾斜",
@@ -118,10 +140,11 @@
         header.append(cell);
       }
       cases.forEach((item, i) => {
-        picker.add(new Option([names[item.scenario], modes[item.mode], "Seed " + item.seed].join(" / "), i));
+        picker.add(new Option([names[item.scenario] || item.scenario, modes[item.mode] || item.mode, "Seed " + item.seed].join(" / "), i));
       });
       const reference = cases.findIndex(item => item.mode === "reference");
-      picker.selectedIndex = reference >= 0 ? reference : Math.max(0, cases.findIndex(item => item.mode === "wam_mimic"));
+      const preferred = cases.findIndex(item => item.mode === "wam_mimic_v2" || item.mode === "wam_mimic");
+      picker.selectedIndex = reference >= 0 ? reference : Math.max(0, preferred);
       for (const [scenario, label] of Object.entries(names)) {
         for (const [mode, controller] of Object.entries(modes)) {
           const group = cases.filter(item => item.scenario === scenario && item.mode === mode);

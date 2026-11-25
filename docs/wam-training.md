@@ -1,4 +1,6 @@
-# 人体 WAM 小规模训练与可视化评估
+# 人体 WAM 小规模训练与可视化评估（Phase 0 历史试验归档）
+
+> **历史归档提示（2026-11-23）**：本文档仅作为 Phase 0 早期人体开环小规模试验（2026-11-18，无本体历史输入、未做 Y-up → FLU 转换、无机器人端到端闭环）的复现记录保留。**当前正式 WAM 训练、数据处理与闭环桥接请严格遵循**：[系统总架构设计](design/design.md)、[统一数据处理方案](design/data-processing.md)、[WAM–Mimic 协同与桥接规范](design/wam-mimic-bridge.md) 与 [WAM 训练手册](train/wam.md)。
 
 本轮训练 `Cosmos-Predict2.5-2B` 最后一个 Transformer block 的原始参数和人体五点动作专家。输入是人体第一视角的历史视频潜码和任务文本，输出未来 10 帧、每帧 45D 五点位姿。没有机器人本体输入、夹爪或手指伪标签。现有 Mimic 目录始终只读。
 

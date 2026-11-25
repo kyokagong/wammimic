@@ -357,7 +357,8 @@ def q1_direct_targets(block, actual, rests, anchor_xy=None, max_lead_m=.08):
 
 
 @torch.inference_mode()
-def predict(wam, vae, frames, text, generator, mean, scale, *, proprio=None, ee_hist=None, embodiment_id=None):
+def predict(wam, vae, frames, text, generator, mean, scale, *, proprio=None, ee_hist=None, embodiment_id=None,
+            prefix_target=None, prefix_weights=None):
     # The cached training contract has four measured history images; repeat the final one for unused latents.
     history = [frames[0], *frames, *([frames[-1]] * 12)]
     pixels = torch.from_numpy(np.stack(history)).permute(3, 0, 1, 2)[None].float() / 127.5 - 1.
@@ -369,7 +370,9 @@ def predict(wam, vae, frames, text, generator, mean, scale, *, proprio=None, ee_
             e_t = torch.as_tensor(ee_hist[None], dtype=torch.float32, device="cuda:0")
             context = wam.encode_history(video, text, proprio=p_t, ee_hist=e_t, embodiment_id=emb_t)
             noise = torch.randn((1, 10, 47), device="cuda:0", generator=generator)
-            return wam.sample(context, noise, 16, embodiment_id=emb_t)[0].cpu().numpy() * scale + mean
+            pt_t = None if prefix_target is None else torch.as_tensor(prefix_target[None], dtype=torch.float32, device="cuda:0")
+            pw_t = None if prefix_weights is None else torch.as_tensor(prefix_weights, dtype=torch.float32, device="cuda:0")
+            return wam.sample(context, noise, 16, embodiment_id=emb_t, prefix_target=pt_t, prefix_weights=pw_t)[0].cpu().numpy() * scale + mean
         context = wam.encode_history(video, text)
         noise = torch.randn((1, 10, 45), device="cuda:0", generator=generator)
         return wam.sample(context, noise, 16)[0].cpu().numpy() * scale + mean
@@ -398,7 +401,7 @@ def render_panel(renderer, mjdata, camera, image, target_pos, status):
 
 @torch.inference_mode()
 def rollout(env, policy, meta, wam, vae, text, stats, rests, optical, scenario, seed, path, steps,
-            mode, scripted=None, state_stats=None):
+            mode, scripted=None, state_stats=None, emb_id=0):
     state_ids = torch.arange(1, device=env.device)
     command = env.command_manager.get_term(COMMAND_NAME)
     command.assign_clips(state_ids, torch.zeros_like(state_ids))
@@ -514,13 +517,13 @@ def rollout(env, policy, meta, wam, vae, text, stats, rests, optical, scenario, 
                         t_arr = np.arange(len(p_arr), dtype=np.float64) * DT
                         hist_idx = np.maximum(np.array([[k - 15, k - 10, k - 5, k]], dtype=int), 1)
                         h75 = human_history(p_arr, t_arr, hist_idx, LEG_LENGTH["q1"])[0]
-                        t_hist = np.asarray(touches_50hz, dtype=np.float32)[hist_idx[0]]
-                        st77 = np.concatenate((h75, t_hist), axis=-1)
-                        st77 = (st77 - s_mean) / s_scale
+                        st75 = (h75 - s_mean[:75]) / s_scale[:75]
                         ee_h4 = np.zeros((4, 4), dtype=np.float32)
-                        ee_h4[:, :2] = st77[:, 75:77]
+                        if len(s_mean) == 77:
+                            t_hist = np.asarray(touches_50hz, dtype=np.float32)[hist_idx[0]]
+                            ee_h4[:, :2] = (t_hist - s_mean[75:77]) / s_scale[75:77]
                         prediction = predict(wam, vae, list(frames), text, generator, mean, scale,
-                                             proprio=st77[:, :75], ee_hist=ee_h4, embodiment_id=0)
+                                             proprio=st75.astype(np.float32), ee_hist=ee_h4, embodiment_id=emb_id)
                         human_block, robot_block = q1_direct_targets(prediction, (actual_pos, actual_rot), rests, anchor_xy=anchor_xy)
                     else:
                         prediction = predict(wam, vae, list(frames), text, generator, mean, scale)
@@ -597,6 +600,7 @@ def main():
     parser.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2])
     parser.add_argument("--out-name", type=str, default=None)
     parser.add_argument("--p1-sim-stats", type=Path, default=None)
+    parser.add_argument("--embodiment-id", type=int, default=None)
     button = parser.add_mutually_exclusive_group()
     button.add_argument("--button-reference", action="store_true")
     button.add_argument("--button-comparison", action="store_true")
@@ -659,22 +663,27 @@ def main():
             result["mimic_checkpoint_sha256"] = sha256(fp)
             write_json(out / "press-button-reference.json", result)
         return
+    saved = torch.load(args.wam_checkpoint, map_location="cpu", weights_only=True)
     if is_p1:
+        dit_block_ids = {int(k.split(".")[2]) for k in saved["expert"] if k.startswith("backbone.transformer_blocks.")}
+        unfreeze_n = len(dit_block_ids)
         wam = CosmosWAM(
             load_backbone(config["backbone"], config["backbone_manifest"], device),
             width=config["width"], layers=config["layers"],
-            train_backbone=False, use_proprio=True, num_embodiments=config["num_embodiments"],
+            unfreeze_blocks=unfreeze_n, use_proprio=True, num_embodiments=config["num_embodiments"],
         ).to(device).eval()
     else:
         wam = CosmosWAM(load_backbone(config["backbone"], config["backbone_manifest"], device), train_backbone=False).to(device).eval()
-    saved = torch.load(args.wam_checkpoint, map_location="cpu", weights_only=True)
     assert saved["step"] == 5000 and saved["expert"].keys() == {k for k, p in wam.named_parameters() if p.requires_grad}
     wam.load_state_dict(saved["expert"], strict=False)
     vae = VideoEncoder("/data/kk/models/wammimic_cosmos25_encoders_20261118")
     bank = load_file(run / "text/prompt_bank_bf16.safetensors", device=device)
     optical = None if is_p1 else optical_stance(protocol)
     act_stats = sim_stats["action"] if is_p1 else protocol["statistics"]["action"]
-    st_stats = sim_stats["observation.state"] if is_p1 else None
+    st_key = "observation.state_5pt_hist" if (is_p1 and "observation.state_5pt_hist" in sim_stats) else "observation.state"
+    st_stats = sim_stats[st_key] if is_p1 else None
+    default_emb = 1 if (is_p1 and "sim" not in config.get("branch_names", [])) else 0
+    emb_id = default_emb if args.embodiment_id is None else args.embodiment_id
     cases = []
     sources = []
     for index, (scenario, task, layout, target) in enumerate(TASKS[:1] if args.button_comparison else TASKS):
@@ -693,7 +702,7 @@ def main():
                 replay = out / f"{scenario}-{f'seed{seed}' if mode == 'wam_mimic' else mode}.mp4"
                 targets = button_reference(env, rests, args.steps, mimic_data / "q1/walk1_subject5.npz") if mode == "reference" else None
                 result = rollout(env, policy, meta, wam, vae, bank[f"task_{index}"][None], act_stats,
-                                 rests, optical, scenario, seed, replay, args.steps, mode, scripted=targets, state_stats=st_stats)
+                                 rests, optical, scenario, seed, replay, args.steps, mode, scripted=targets, state_stats=st_stats, emb_id=emb_id)
                 cases.append(result)
                 print(json.dumps({k: v for k, v in result.items() if k not in ("planning_calls", "physics")}), flush=True)
         finally:

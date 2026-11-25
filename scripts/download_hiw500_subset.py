@@ -119,12 +119,14 @@ def build_selection(out_dir: Path, budget_gb: float) -> dict:
 
 
 def download_all(out_dir: Path, manifest: dict, workers: int) -> None:
+    import subprocess
     files = manifest["files"]
     status_path = out_dir / "hiw500-download-status.json"
     started = time.time()
     done_files = 0
     done_bytes = 0
     failed = []
+    sha = manifest["sha"]
 
     def _fetch(item):
         rel = item["path"]
@@ -132,14 +134,27 @@ def download_all(out_dir: Path, manifest: dict, workers: int) -> None:
         dest = out_dir / rel
         if dest.is_file() and dest.stat().st_size == expected:
             return (rel, expected, True, "cached")
-        for attempt in range(1, 8):
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        part = dest.with_suffix(dest.suffix + ".part")
+        url = f"https://huggingface.co/datasets/{REPO_ID}/resolve/{sha}/{rel}"
+        for attempt in range(1, 10):
             try:
-                hf_hub_download(REPO_ID, rel, repo_type="dataset", revision=manifest["sha"], local_dir=str(out_dir))
-                if dest.is_file() and dest.stat().st_size == expected:
+                res = subprocess.run(
+                    ["curl", "-fsSL", "-C", "-", "--connect-timeout", "20", "--max-time", "600",
+                     "--retry", "3", "--retry-delay", "3", "-o", str(part), url],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+                )
+                if res.returncode != 0:
+                    raise IOError(res.stderr.strip()[-120:] or f"curl rc={res.returncode}")
+                if part.is_file() and part.stat().st_size == expected:
+                    part.replace(dest)
                     return (rel, expected, True, "downloaded")
-                raise IOError(f"size mismatch {dest.stat().st_size if dest.exists() else 0} != {expected}")
+                actual = part.stat().st_size if part.is_file() else 0
+                if actual > expected:
+                    part.unlink(missing_ok=True)
+                raise IOError(f"size mismatch {actual} != {expected}")
             except Exception as err:
-                if attempt == 7:
+                if attempt == 9:
                     return (rel, 0, False, f"{type(err).__name__}: {str(err)[:120]}")
                 time.sleep(min(3 * attempt, 15))
         return (rel, 0, False, "exhausted")
@@ -160,11 +175,13 @@ def download_all(out_dir: Path, manifest: dict, workers: int) -> None:
 
     _write_status()
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-        for rel, sz, ok, msg in pool.map(_fetch, files):
+        futs = [pool.submit(_fetch, item) for item in files]
+        for fut in concurrent.futures.as_completed(futs):
+            rel, sz, ok, msg = fut.result()
             if ok:
                 done_files += 1
                 done_bytes += sz
-                if done_files % 20 == 0 or done_files == len(files):
+                if done_files % 15 == 0 or done_files == len(files):
                     print(f"[{done_files}/{len(files)}] {done_bytes/1e9:.2f}/{manifest['total_bytes']/1e9:.2f} GB ({(time.time()-started)/60:.1f} min)", flush=True)
             else:
                 failed.append({"path": rel, "error": msg})

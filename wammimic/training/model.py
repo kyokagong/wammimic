@@ -33,14 +33,19 @@ def load_backbone(root,manifest,device):
 
 
 class CosmosWAM(nn.Module):
-    def __init__(self,backbone,width=256,layers=3,*,train_backbone=True,use_proprio=False,num_embodiments=0):
+    def __init__(self,backbone,width=256,layers=3,*,train_backbone=True,unfreeze_blocks=None,use_proprio=False,num_embodiments=0):
         super().__init__();self.backbone=backbone;self.backbone.requires_grad_(False)
-        self.train_backbone=bool(train_backbone)
+        if unfreeze_blocks is None:
+            self.unfreeze_blocks=1 if train_backbone else 0
+        else:
+            self.unfreeze_blocks=int(unfreeze_blocks)
+        self.train_backbone=self.unfreeze_blocks>0
         self.use_proprio=bool(use_proprio)
         self.num_embodiments=int(num_embodiments)
         # FP32 master weights make small last-block updates survive BF16 quantization.
-        if train_backbone:
-            self.backbone.transformer_blocks[-1].float().requires_grad_(True)
+        if self.unfreeze_blocks>0:
+            for block in self.backbone.transformer_blocks[-self.unfreeze_blocks:]:
+                block.float().requires_grad_(True)
         hidden=backbone.config.num_attention_heads*backbone.config.attention_head_dim
         self.context=nn.Sequential(nn.LayerNorm(hidden),nn.Linear(hidden,width))
         self.action_in=nn.Linear(45,width);self.action_out=nn.Linear(width,45)
@@ -111,6 +116,10 @@ class CosmosWAM(nn.Module):
             return torch.cat([body_out,ee_pred],dim=-1)
         return body_out
 
+    def forward(self,video,text,noisy_actions,time,*,proprio=None,ee_hist=None,embodiment_id=None):
+        context=self.encode_history(video,text,proprio=proprio,ee_hist=ee_hist,embodiment_id=embodiment_id)
+        return self.action_velocity(context,noisy_actions,time,embodiment_id=embodiment_id)
+
     def video_velocity(self,noisy_video,text,sigma):
         mask=torch.zeros_like(noisy_video[:,:1]);mask[:,:,:2]=1
         timestep=mask[:,:,:,:1,:1]*.0001+(1-mask[:,:,:,:1,:1])*sigma[:,None,None,None,None]
@@ -120,12 +129,24 @@ class CosmosWAM(nn.Module):
         return result
 
     @torch.no_grad()
-    def sample(self,context,noise,steps=16,embodiment_id=None):
+    def sample(self,context,noise,steps=16,embodiment_id=None,prefix_target=None,prefix_weights=None):
         if steps<1:raise ValueError('At least one flow integration step is required')
         action=noise.clone()
+        use_rtc=prefix_target is not None and prefix_weights is not None
+        if use_rtc:
+            w=prefix_weights.to(device=action.device,dtype=action.dtype)
+            if w.ndim==1:w=w[None,:,None]
+            elif w.ndim==2:w=w[:,:,None]
+            p_tgt=prefix_target.to(device=action.device,dtype=action.dtype)
         for i in range(steps):
-            time=torch.full((len(action),),i/steps,device=action.device)
+            t_val=i/steps
+            if use_rtc and i>0:
+                noisy_prefix=(1.0-t_val)*noise+t_val*p_tgt
+                action=(1.0-w)*action+w*noisy_prefix
+            time=torch.full((len(action),),t_val,device=action.device)
             action=action+self.action_velocity(context,action,time,embodiment_id=embodiment_id)/steps
+        if use_rtc:
+            action=(1.0-w)*action+w*p_tgt
         return action.float()
 
 

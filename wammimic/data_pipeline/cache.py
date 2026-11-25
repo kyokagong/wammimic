@@ -170,7 +170,7 @@ def read_video(path,frames):
 
 
 def cache_videos(model_root,output,batch_size=2,*,dataset_name="g1_parallel_gripper"):
-    if dataset_name not in {"g1_parallel_gripper","human_ego","q1_stub","nymeria_ego"}:raise ValueError("Unknown WAM dataset")
+    if dataset_name not in {"g1_parallel_gripper","g1_hiw500","human_ego","q1_stub","nymeria_ego"}:raise ValueError("Unknown WAM dataset")
     output=Path(output);dataset=output/"wam_lerobot_v2"/dataset_name
     info=json.loads((dataset/"meta/info.json").read_text())
     if info["world_model"]!="Cosmos-Predict2.5-2B" or info["fps"]!=10:
@@ -205,17 +205,21 @@ def cache_videos(model_root,output,batch_size=2,*,dataset_name="g1_parallel_grip
         if not len(indices):raise ValueError(f"No causal training windows in {episode}")
         pixels=read_video(video,row["length"])
         encoder=encoder or VideoEncoder(model_root)
+        # Keep episode frames in uint8 on GPU (~75 MB per 500 frames) to avoid CPU copy/PCIe stalls.
+        pix_gpu=torch.from_numpy(pixels.copy()).permute(0,3,1,2).to(device="cuda:0",non_blocking=True)
         latents=[]
         for start in range(0,len(indices),batch_size):
             batch=indices[start:start+batch_size]
             frame_map=np.stack([clip_frame_indices(int(i)) for i in batch])
-            tensor=torch.from_numpy(pixels[frame_map].copy()).permute(0,4,1,2,3).float()/127.5-1
+            fm=torch.from_numpy(frame_map).to(device="cuda:0",non_blocking=True)
+            tensor=pix_gpu[fm].permute(0,2,1,3,4).float().div_(127.5).sub_(1.0)
             if not causal_checked:
                 check_causal_prefix(encoder,tensor)
                 causal_checked=True
             latents.append(encoder.encode(tensor).cpu())
             if (start//batch_size)%32==0:
                 print(f"Video episode {episode}: {min(start+batch_size,len(indices))}/{len(indices)} windows",flush=True)
+        del pix_gpu
         tensor=torch.cat(latents).contiguous()
         dest.parent.mkdir(parents=True,exist_ok=True)
         temporary=dest.with_suffix(".tmp")
